@@ -29,7 +29,9 @@
 *
 */
 
+#include <float.h>
 #include <getopt.h>
+#include <limits.h>
 #include <math.h>
 #include <mpi.h>
 #include <stdio.h>
@@ -47,6 +49,7 @@ int *displs;
 int assoc = 0;
 int input_numbers[4];
 int input_method2 = 0;
+int local_rank, num_procs;
 
 MPI_Datatype resizedtype;
 MPI_Comm comm_hor, comm_vert, comm_vert_col, comm_hor_row, comm_hor_col;
@@ -56,7 +59,9 @@ double gen_time, proc_time, comm_time, total_time;
 int hasReceivedAkk = -1;
 
 typedef enum { 
-  linear
+  linear,
+  nn,
+  greedy
 } TYPE;
 TYPE type;
 
@@ -64,8 +69,16 @@ typedef struct {
   int line;
   float x;
   float y;
+  int visited;
 } LOCATION;
 LOCATION *locations;
+
+typedef struct {
+  float cost;
+  int pointA;
+  int pointB;
+} COST;
+
 
 int parse_arguments(int argc, char **argv);
 void parse_file();
@@ -97,15 +110,19 @@ void block_mat_mult(float *A, float *B, float *C, int q);
 void printMatrix(float *A, int nElem);
 void swap(int *p1, int *p2);
 void permute();
+void nearest_neighbor();
+void do_greedy();
+void bubbleSort(COST *array, int array_size);
 void display(int *a, int *count, float cost);
 float calculate_cost(int *a);
 float dist(LOCATION a, LOCATION b);
+int find_nearest(int current, int start, int end);
 
 int main(int argc, char **argv) {
 	double t_start, t_end;
   int *ptr_gen_array, elem_per_node;
   float *C, *local_array;  
-  int i, num_procs, local_rank, name_len;
+  int i, name_len;
   double start, end, dt;
 
 	char proc_name[MPI_MAX_PROCESSOR_NAME];
@@ -118,11 +135,17 @@ int main(int argc, char **argv) {
   // Initialize MPI
   MPI_Init(&argc, &argv); 
 	MPI_Get_processor_name(proc_name, &name_len);
-  
+  MPI_Comm_rank(MPI_COMM_WORLD, &local_rank);
+	MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
+
   t_start = MPI_Wtime();
   
   if( type == linear ) {
     permute();
+  } else if( type == nn ) {
+    nearest_neighbor();
+  } else if( type == greedy ) {
+    do_greedy();
   }
 
   t_end = MPI_Wtime();
@@ -212,6 +235,156 @@ void permute() {
   }
 }
 
+int find_nearest(int current, int start, int end) {
+  int i, index;
+  float min = FLT_MAX;
+  float distance;
+
+  index = -1;
+  for( i = start; i<= end; ++i ) {
+    distance = dist(locations[current], locations[i]);
+    if( distance < min && i != current && locations[i].visited == 0 ) {
+      min = distance;
+      index = i;
+    }
+  }
+
+  return index;
+}
+
+void nearest_neighbor() {
+  int i, j, index;
+  float cost = 0.0f;
+  int starting_loc, ending_loc;
+  int loc_per_node = n / num_procs;
+  int next;
+  int *index_of_min;
+  float distance;
+  float min = FLT_MAX;
+  int final_path[n];
+
+  index_of_min = (int*)malloc(sizeof(int) * num_procs);
+  starting_loc = loc_per_node * local_rank;
+  ending_loc = starting_loc + loc_per_node - 1;
+  if( local_rank == num_procs - 1 ) ending_loc += n % num_procs;
+  
+  next = 0;
+  final_path[0] = 0;
+  for( i = 0; i < n - 1; i++ ) {
+    //cost +=
+    // Find the nearest neighbor to
+    MPI_Bcast(&next, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    locations[next].visited = 1;
+    //printf("Path:%d i=%d\n", next[0], i);
+    int index = find_nearest(next, starting_loc, ending_loc);
+    MPI_Gather(&index, 1, MPI_INT, index_of_min, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    
+    //printf("%d: next:%d index=%d i:%d dist:%f\n", local_rank, next, index, i, dist(locations[next], locations[index]));
+    if( local_rank == 0 ) {
+      index = index_of_min[0];
+      // find the nearest
+      min = FLT_MAX;
+      for( j = 0; j < num_procs; ++j ) {
+        if( index_of_min[j] < 0 ) continue;
+        distance = dist(locations[next], locations[index_of_min[j]]);
+        if( distance < min ) {
+          min = distance;
+          index = index_of_min[j];
+        }
+      }
+      //printf("Nearest is %d\n", index);
+      next = index;
+      final_path[i + 1] = index;
+    }
+      
+    MPI_Barrier(MPI_COMM_WORLD);
+    //break;
+  }
+  
+  if( local_rank == 0 ) {
+    for( i = 0; i < n; ++i ) {
+      printf("%d ", final_path[i]);
+    }
+    printf("\n");
+  }
+  free(index_of_min);
+}
+
+void bubbleSort(COST *array, int array_size) {
+  int i, j;
+  COST temp;
+  
+  for( i = (array_size - 1); i > 0; --i ) {
+    for( j = 1; j <= i; ++j ) {
+      if( array[j-1].cost > array[j].cost ) { 
+        temp = array[j-1];
+        array[j-1] = array[j];
+        array[j] = temp;
+      }
+    }
+  }
+}
+
+void do_greedy() {
+  int i, j, local_i;;
+  int starting_row, ending_row, rows_per_node;
+  COST *matrix;
+  COST *ptr_matrix;
+  MPI_Status status;
+
+  rows_per_node = n / num_procs;
+  starting_row = rows_per_node * local_rank;
+  ending_row = starting_row + rows_per_node - 1;
+  if( local_rank == num_procs - 1 ) {
+    ending_row += n % num_procs;
+    rows_per_node += n % num_procs; 
+  }
+  
+  matrix = (COST*)malloc(sizeof(COST) * rows_per_node * n);
+
+  // Build the adj matrix
+  local_i = 0;
+  for( i = starting_row; i <= ending_row; ++i ) {
+    for( j = 0; j < n; ++j ) {
+      if( i >= j ) matrix[local_i * n + j].cost = 0;
+      else {
+        matrix[local_i * n + j].cost = dist(locations[i], locations[j]);
+        matrix[local_i * n + j].pointA = i;
+        matrix[local_i * n + j].pointB = j;
+      }
+    }
+    local_i++;
+  }
+  bubbleSort(matrix, rows_per_node * n);
+
+  ptr_matrix = matrix;
+  while(ptr_matrix != &matrix[rows_per_node * n - 1]) {
+    if( ptr_matrix->cost == 0 ) ptr_matrix++;
+    else break;
+  }
+  
+  if( local_rank == 0 ){
+    while(ptr_matrix != &matrix[rows_per_node * n - 1]) {
+      printf("%f ", ptr_matrix->cost);
+      ptr_matrix++;
+    }
+    printf("\n");
+  }
+
+
+  if(local_rank == 0) {
+    float res[num_procs];
+    res[0] = ptr_matrix->cost;
+    for( i = 1; i < num_procs; i++ ) {
+      MPI_Recv(res, num_procs, MPI_FLOAT, i, 0, MPI_COMM_WORLD, &status);
+    }
+  } else {
+    MPI_Send(&(ptr_matrix->cost), 1, MPI_FLOAT, 0, 0, MPI_COMM_WORLD);
+  }
+  free(matrix);
+}
+
+
 void parse_file() {
   FILE *fp;
   int i, line;
@@ -241,6 +414,7 @@ void parse_file() {
     locations[line - 1].line = line;
     locations[line - 1].x = x;
     locations[line - 1].y = y;
+    locations[line - 1].visited = 0;
     
     if(line == n) break;
     //printf("%d %f %f\n", locations[line - 1].line, locations[line - 1].x, locations[line - 1].y);
@@ -295,8 +469,10 @@ int parse_arguments(int argc, char **argv) {
         break;
       case 't':
         if( strcmp(optarg, "linear" ) == 0 ) type = linear;
+        else if( strcmp(optarg, "nn" ) == 0 ) type = nn;
+        else if( strcmp(optarg, "greedy" ) == 0 ) type = greedy;
         else {
-          fprintf( stderr, "Option -%c %s in incorrect. Allowed values are: linear\n", optopt, optarg);
+          fprintf( stderr, "Option -%c %s in incorrect. Allowed values are: linear, nn, greedy\n", optopt, optarg);
           return 1;
         }
         break;
