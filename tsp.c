@@ -75,7 +75,6 @@ void parse_file();
 void swap(int *p1, int *p2);
 void permute();
 void nearest_neighbor();
-void bubbleSort(COST *array, int array_size);
 void display(int *a, int *count, float cost);
 float calculate_cost(int *a);
 float dist(LOCATION a, LOCATION b);
@@ -278,21 +277,6 @@ void nearest_neighbor() {
     printf("\n");
   }
   free(index_of_min);
-}
-
-void bubbleSort(COST *array, int array_size) {
-  int i, j;
-  COST temp;
-  
-  for( i = (array_size - 1); i > 0; --i ) {
-    for( j = 1; j <= i; ++j ) {
-      if( array[j-1].cost > array[j].cost ) { 
-        temp = array[j-1];
-        array[j-1] = array[j];
-        array[j] = temp;
-      }
-    }
-  }
 }
 
 void parse_file() {
